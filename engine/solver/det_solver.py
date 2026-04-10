@@ -10,6 +10,8 @@ import time
 import json
 import datetime
 import math
+import os
+from pathlib import Path
 
 import torch
 
@@ -18,6 +20,179 @@ from ..misc import dist_utils, stats
 from ._solver import BaseSolver
 from .det_engine import train_one_epoch, evaluate
 from ..optim.lr_scheduler import FlatCosineLRScheduler
+
+
+def _load_interest_class_name_set():
+    """Load interest class names from dataset config.
+
+    Returns a set of lowercased names. If config is missing/invalid, returns None
+    so the caller can fall back to all classes.
+    """
+    candidates: list[Path] = []
+
+    env_cfg = os.getenv("DATASET_CLASSES_CONFIG_PATH")
+    if env_cfg:
+        candidates.append(Path(env_cfg).resolve())
+
+    # det_solver.py -> solver/engine/RT-DETRv4/third_party/<project_root>
+    project_root = Path(__file__).resolve().parents[4]
+    candidates.append((project_root / "configs" / "dataset_classes.json").resolve())
+
+    for cfg_path in candidates:
+        if not cfg_path.exists():
+            continue
+        try:
+            payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+            target_classes = payload.get("target_classes", [])
+            interest_classes = payload.get("interest_classes", [])
+            if not isinstance(target_classes, list):
+                target_classes = []
+            if not isinstance(interest_classes, list):
+                interest_classes = []
+            if not interest_classes:
+                interest_classes = target_classes
+
+            normalized = {
+                str(name).strip().lower()
+                for name in interest_classes
+                if str(name).strip()
+            }
+            if normalized:
+                print(f"[RTv4] Interest classes loaded ({len(normalized)}) from {cfg_path}")
+                return normalized
+        except Exception as e:
+            print(f"[RTv4] Warning: could not parse interest classes from {cfg_path}: {e}")
+
+    print("[RTv4] Interest classes config not found/invalid. Falling back to all classes.")
+    return None
+
+
+def _compute_interest_custom_fitness(coco_evaluator, interest_name_set):
+    """Compute custom_fitness like YOLO callback, but from RTv4 COCOeval tensors.
+
+    Formula: custom_fitness = 0.8 * mean_f1_interest + 0.2 * mean_ap50_interest
+    where both means are computed only across interest classes.
+    """
+    if coco_evaluator is None:
+        return None
+
+    coco_bbox_eval = None
+    try:
+        coco_bbox_eval = coco_evaluator.coco_eval.get("bbox")
+    except Exception:
+        coco_bbox_eval = None
+    if coco_bbox_eval is None:
+        return None
+
+    eval_payload = getattr(coco_bbox_eval, "eval", None)
+    params = getattr(coco_bbox_eval, "params", None)
+    if not isinstance(eval_payload, dict) or params is None:
+        return None
+
+    precision = eval_payload.get("precision")
+    if precision is None:
+        return None
+
+    def _seq_to_list(value):
+        if value is None:
+            return []
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            return list(value)
+        return [value]
+
+    cat_ids = [int(v) for v in _seq_to_list(getattr(params, "catIds", None))]
+    if not cat_ids:
+        return None
+    catid_to_idx = {cid: i for i, cid in enumerate(cat_ids)}
+
+    iou_thrs = [float(v) for v in _seq_to_list(getattr(params, "iouThrs", None))]
+    if not iou_thrs:
+        return None
+    iou_idx = min(range(len(iou_thrs)), key=lambda i: abs(float(iou_thrs[i]) - 0.5))
+
+    area_labels = [str(v) for v in _seq_to_list(getattr(params, "areaRngLbl", None))]
+    area_idx = area_labels.index("all") if "all" in area_labels else 0
+
+    max_dets = [int(v) for v in _seq_to_list(getattr(params, "maxDets", None))]
+    max_det_idx = len(max_dets) - 1 if max_dets else 0
+
+    rec_thrs = [float(v) for v in _seq_to_list(getattr(params, "recThrs", None))]
+
+    id_to_name = {}
+    try:
+        raw_cats = getattr(coco_evaluator.coco_gt, "cats", {})
+        if isinstance(raw_cats, dict):
+            id_to_name = {
+                int(k): str(v.get("name", "")).strip().lower()
+                for k, v in raw_cats.items()
+                if isinstance(v, dict)
+            }
+    except Exception:
+        id_to_name = {}
+
+    if interest_name_set:
+        selected_cat_ids = [
+            cid for cid in cat_ids
+            if id_to_name.get(int(cid), "") in interest_name_set
+        ]
+        # If mapping fails for any reason, keep training robust and fallback to all classes.
+        if not selected_cat_ids:
+            selected_cat_ids = list(cat_ids)
+    else:
+        selected_cat_ids = list(cat_ids)
+
+    f1_scores = []
+    ap50_scores = []
+    eps = 1e-7
+
+    for cid in selected_cat_ids:
+        try:
+            k_idx = catid_to_idx[int(cid)]
+            # COCO precision shape: [TxRxKxAxM]
+            pr_curve = precision[iou_idx, :, k_idx, area_idx, max_det_idx]
+        except Exception:
+            continue
+
+        valid_pairs = []
+        for ridx, p_raw in enumerate(pr_curve):
+            try:
+                p = float(p_raw)
+            except Exception:
+                continue
+            if p <= -1.0:
+                continue
+
+            if rec_thrs and ridx < len(rec_thrs):
+                r = float(rec_thrs[ridx])
+            else:
+                r = float(ridx) / float(max(1, len(pr_curve) - 1))
+
+            valid_pairs.append((p, r))
+
+        if not valid_pairs:
+            continue
+
+        ap50_cls = sum(p for p, _ in valid_pairs) / len(valid_pairs)
+        f1_cls = max((2.0 * p * r / (p + r + eps)) for p, r in valid_pairs)
+
+        ap50_scores.append(float(ap50_cls))
+        f1_scores.append(float(f1_cls))
+
+    if not f1_scores or not ap50_scores:
+        return None
+
+    mean_f1_interest = float(sum(f1_scores) / len(f1_scores))
+    mean_ap50_interest = float(sum(ap50_scores) / len(ap50_scores))
+    custom_fitness = float((0.8 * mean_f1_interest) + (0.2 * mean_ap50_interest))
+
+    return {
+        "custom_fitness": custom_fitness,
+        "mean_f1_interest": mean_f1_interest,
+        "mean_ap50_interest": mean_ap50_interest,
+        "n_interest_classes_used": int(len(f1_scores)),
+    }
 
 
 class DetSolver(BaseSolver):
@@ -42,6 +217,8 @@ class DetSolver(BaseSolver):
 
         top1 = 0
         best_stat = {'epoch': -1, }
+        interest_name_set = _load_interest_class_name_set()
+        best_custom_fitness = float('-inf')
         # evaluate again before resume training
         if self.last_epoch > 0:
             module = self.ema.module if self.ema else self.model
@@ -54,10 +231,21 @@ class DetSolver(BaseSolver):
                 self.device
             )
             for k in test_stats:
+                try:
+                    metric_value = float(test_stats[k][0])
+                except Exception:
+                    continue
                 best_stat['epoch'] = self.last_epoch
-                best_stat[k] = test_stats[k][0]
-                top1 = test_stats[k][0]
-                print(f'best_stat: {best_stat}')
+                best_stat[k] = metric_value
+                top1 = metric_value
+
+            resume_custom = _compute_interest_custom_fitness(coco_evaluator, interest_name_set)
+            if resume_custom is not None:
+                best_custom_fitness = float(resume_custom['custom_fitness'])
+                best_stat['custom_fitness'] = best_custom_fitness
+                top1 = best_custom_fitness
+
+            print(f'best_stat: {best_stat}')
 
         best_stat_print = best_stat.copy()
         start_time = time.time()
@@ -158,53 +346,105 @@ class DetSolver(BaseSolver):
                 self.device
             )
 
-            # TODO
+            # Keep raw COCO metrics in logs/TensorBoard for compatibility.
             for k in test_stats:
                 if self.writer and dist_utils.is_main_process():
                     for i, v in enumerate(test_stats[k]):
                         self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+                        self.writer.add_scalar(f'Val/{k}_{i}'.format(k), v, epoch)
+
+                try:
+                    metric_value = float(test_stats[k][0])
+                except Exception:
+                    continue
 
                 if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
+                    best_stat['epoch'] = epoch if metric_value > best_stat[k] else best_stat['epoch']
+                    best_stat[k] = max(best_stat[k], metric_value)
                 else:
                     best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
+                    best_stat[k] = metric_value
 
-                if best_stat[k] > top1:
-                    best_stat_print['epoch'] = epoch
-                    top1 = best_stat[k]
-                    if self.output_dir:
-                        if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
-                        else:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
+            custom_metrics = _compute_interest_custom_fitness(coco_evaluator, interest_name_set)
+            epoch_custom_fitness = None
+            if custom_metrics is not None:
+                epoch_custom_fitness = float(custom_metrics['custom_fitness'])
+                best_custom_fitness = max(best_custom_fitness, epoch_custom_fitness)
+                best_stat['custom_fitness'] = float(best_custom_fitness)
 
-                best_stat_print[k] = max(best_stat[k], top1)
-                print(f'best_stat: {best_stat_print}')  # global best
+                if self.writer and dist_utils.is_main_process():
+                    self.writer.add_scalar('Test/custom_fitness', epoch_custom_fitness, epoch)
+                    self.writer.add_scalar('Test/mean_f1_interest', float(custom_metrics['mean_f1_interest']), epoch)
+                    self.writer.add_scalar('Test/mean_ap50_interest', float(custom_metrics['mean_ap50_interest']), epoch)
+                    self.writer.add_scalar('Val/custom_fitness', epoch_custom_fitness, epoch)
+                    self.writer.add_scalar('Val/mean_f1_interest', float(custom_metrics['mean_f1_interest']), epoch)
+                    self.writer.add_scalar('Val/mean_ap50_interest', float(custom_metrics['mean_ap50_interest']), epoch)
 
-                if best_stat['epoch'] == epoch and self.output_dir:
+                print(
+                    f"--> [EPOCH {epoch}] Custom Fitness (interest): {epoch_custom_fitness:.4f} "
+                    f"(Best: {best_custom_fitness:.4f})"
+                )
+
+            # Use custom_fitness as the primary checkpoint criterion when available.
+            epoch_selection_score = epoch_custom_fitness
+            if epoch_selection_score is None:
+                for k in test_stats:
+                    try:
+                        epoch_selection_score = float(test_stats[k][0])
+                        break
+                    except Exception:
+                        continue
+
+            improved = epoch_selection_score is not None and float(epoch_selection_score) > float(top1)
+
+            if improved:
+                best_stat_print['epoch'] = epoch
+                top1 = float(epoch_selection_score)
+                if self.output_dir:
                     if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                        if test_stats[k][0] > top1:
-                            top1 = test_stats[k][0]
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
+                        dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
                     else:
-                        top1 = max(test_stats[k][0], top1)
                         dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
 
-                elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                    best_stat = {'epoch': -1, }
-                    self.ema.decay -= 0.0001
-                    self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
-                    print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
+            for k in test_stats:
+                try:
+                    best_stat_print[k] = float(best_stat.get(k, test_stats[k][0]))
+                except Exception:
+                    pass
+
+            if epoch_custom_fitness is not None:
+                best_stat_print['custom_fitness'] = float(epoch_custom_fitness)
+                best_stat_print['custom_fitness_best'] = float(best_custom_fitness)
+                best_stat_print['mean_f1_interest'] = float(custom_metrics['mean_f1_interest'])
+                best_stat_print['mean_ap50_interest'] = float(custom_metrics['mean_ap50_interest'])
+
+            print(f'best_stat: {best_stat_print}')  # global best
+
+            if (not improved) and epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                best_stat = {'epoch': -1, }
+                if best_custom_fitness != float('-inf'):
+                    best_stat['custom_fitness'] = float(best_custom_fitness)
+                self.ema.decay -= 0.0001
+                self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
+                print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
 
             log_stats = {
                 **{f'train_{k}': v for k, v in train_stats.items()},
+                **{f'val_{k}': v for k, v in test_stats.items()},
                 **{f'test_{k}': v for k, v in test_stats.items()},
                 'epoch': epoch,
                 'n_parameters': n_parameters
             }
+            if custom_metrics is not None:
+                log_stats['val_custom_fitness'] = float(custom_metrics['custom_fitness'])
+                log_stats['val_mean_f1_interest'] = float(custom_metrics['mean_f1_interest'])
+                log_stats['val_mean_ap50_interest'] = float(custom_metrics['mean_ap50_interest'])
+                log_stats['val_n_interest_classes_used'] = int(custom_metrics['n_interest_classes_used'])
+                log_stats['test_custom_fitness'] = float(custom_metrics['custom_fitness'])
+                log_stats['test_mean_f1_interest'] = float(custom_metrics['mean_f1_interest'])
+                log_stats['test_mean_ap50_interest'] = float(custom_metrics['mean_ap50_interest'])
+                log_stats['test_n_interest_classes_used'] = int(custom_metrics['n_interest_classes_used'])
 
             if self.output_dir and dist_utils.is_main_process():
                 with (self.output_dir / "log.txt").open("a") as f:

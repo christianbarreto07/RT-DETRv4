@@ -205,3 +205,12 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+configs/rtv4/rtv4_hgnetv2_s_pitaya_fold0.yml
+configs/rtv4/rtv4_hgnetv2_s_mirtilos_fold0.yml
+configs/rtv4/auto_generated/standard_RTv4-S-hgnet_20260326_133951_fold_repeat_1_A_to_B_rtv4.yml
+configs/rtv4/auto_generated/standard_RTv4-S-hgnet_20260326_132935_fold_repeat_1_A_to_B_rtv4.yml
+configs/rtv4/auto_generated/standard_RTv4-S-hgnet_20260326_132548_fold_repeat_1_A_to_B_rtv4.yml
+configs/rtv4/auto_generated/cv_run_fold_repeat_2_B_to_A_rtv4.yml
+configs/rtv4/auto_generated/cv_run_fold_repeat_2_A_to_B_rtv4.yml
+configs/rtv4/auto_generated/cv_run_fold_repeat_1_B_to_A_rtv4.yml
+configs/rtv4/auto_generated/cv_run_fold_repeat_1_A_to_B_rtv4.yml

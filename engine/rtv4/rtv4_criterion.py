@@ -78,9 +78,10 @@ class RTv4Criterion(nn.Module):
         teacher_feature_map = outputs.get('teacher_encoder_output')
 
         if student_feature_map is None or teacher_feature_map is None:
+            fallback_device = next(iter(outputs.values())).device
             return {'loss_distill': torch.tensor(0.0,
-                                                 device=student_feature_map.device if student_feature_map is not None else torch.device(
-                                                     'cuda'), requires_grad=True)}
+                                                 device=student_feature_map.device if student_feature_map is not None else fallback_device,
+                                                 requires_grad=True)}
 
         # _logger.info(f"[RTv4Criterion] Student feature map shape: {student_feature_map.shape}")
         # _logger.info(f"[RTv4Criterion] Teacher feature map shape: {teacher_feature_map.shape}")

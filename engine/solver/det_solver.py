@@ -71,7 +71,6 @@ def _compute_interest_custom_fitness(coco_evaluator, interest_name_set):
     """Compute custom_fitness like YOLO callback, but from RTv4 COCOeval tensors.
 
     Formula: custom_fitness = 0.8 * mean_f1_interest + 0.2 * mean_ap50_interest
-    where both means are computed only across interest classes.
     """
     if coco_evaluator is None:
         return None
@@ -143,55 +142,29 @@ def _compute_interest_custom_fitness(coco_evaluator, interest_name_set):
     else:
         selected_cat_ids = list(cat_ids)
 
-    f1_scores = []
-    ap50_scores = []
-    eps = 1e-7
-
+    f1_scores, ap50_scores = [], []
     for cid in selected_cat_ids:
         try:
             k_idx = catid_to_idx[int(cid)]
-            # COCO precision shape: [TxRxKxAxM]
             pr_curve = precision[iou_idx, :, k_idx, area_idx, max_det_idx]
+            ap50_cls, f1_cls = calculate_scores(pr_curve, rec_thrs)
+            ap50_scores.append(ap50_cls)
+            f1_scores.append(f1_cls)
         except Exception:
             continue
-
-        valid_pairs = []
-        for ridx, p_raw in enumerate(pr_curve):
-            try:
-                p = float(p_raw)
-            except Exception:
-                continue
-            if p <= -1.0:
-                continue
-
-            if rec_thrs and ridx < len(rec_thrs):
-                r = float(rec_thrs[ridx])
-            else:
-                r = float(ridx) / float(max(1, len(pr_curve) - 1))
-
-            valid_pairs.append((p, r))
-
-        if not valid_pairs:
-            continue
-
-        ap50_cls = sum(p for p, _ in valid_pairs) / len(valid_pairs)
-        f1_cls = max((2.0 * p * r / (p + r + eps)) for p, r in valid_pairs)
-
-        ap50_scores.append(float(ap50_cls))
-        f1_scores.append(float(f1_cls))
 
     if not f1_scores or not ap50_scores:
         return None
 
-    mean_f1_interest = float(sum(f1_scores) / len(f1_scores))
-    mean_ap50_interest = float(sum(ap50_scores) / len(ap50_scores))
-    custom_fitness = float((0.8 * mean_f1_interest) + (0.2 * mean_ap50_interest))
+    mean_f1_interest = sum(f1_scores) / len(f1_scores)
+    mean_ap50_interest = sum(ap50_scores) / len(ap50_scores)
+    custom_fitness = 0.8 * mean_f1_interest + 0.2 * mean_ap50_interest
 
     return {
         "custom_fitness": custom_fitness,
         "mean_f1_interest": mean_f1_interest,
         "mean_ap50_interest": mean_ap50_interest,
-        "n_interest_classes_used": int(len(f1_scores)),
+        "n_interest_classes_used": len(f1_scores),
     }
 
 
@@ -350,7 +323,6 @@ class DetSolver(BaseSolver):
             for k in test_stats:
                 if self.writer and dist_utils.is_main_process():
                     for i, v in enumerate(test_stats[k]):
-                        self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
                         self.writer.add_scalar(f'Val/{k}_{i}'.format(k), v, epoch)
 
                 try:
@@ -373,9 +345,6 @@ class DetSolver(BaseSolver):
                 best_stat['custom_fitness'] = float(best_custom_fitness)
 
                 if self.writer and dist_utils.is_main_process():
-                    self.writer.add_scalar('Test/custom_fitness', epoch_custom_fitness, epoch)
-                    self.writer.add_scalar('Test/mean_f1_interest', float(custom_metrics['mean_f1_interest']), epoch)
-                    self.writer.add_scalar('Test/mean_ap50_interest', float(custom_metrics['mean_ap50_interest']), epoch)
                     self.writer.add_scalar('Val/custom_fitness', epoch_custom_fitness, epoch)
                     self.writer.add_scalar('Val/mean_f1_interest', float(custom_metrics['mean_f1_interest']), epoch)
                     self.writer.add_scalar('Val/mean_ap50_interest', float(custom_metrics['mean_ap50_interest']), epoch)
@@ -432,7 +401,6 @@ class DetSolver(BaseSolver):
             log_stats = {
                 **{f'train_{k}': v for k, v in train_stats.items()},
                 **{f'val_{k}': v for k, v in test_stats.items()},
-                **{f'test_{k}': v for k, v in test_stats.items()},
                 'epoch': epoch,
                 'n_parameters': n_parameters
             }
@@ -441,10 +409,6 @@ class DetSolver(BaseSolver):
                 log_stats['val_mean_f1_interest'] = float(custom_metrics['mean_f1_interest'])
                 log_stats['val_mean_ap50_interest'] = float(custom_metrics['mean_ap50_interest'])
                 log_stats['val_n_interest_classes_used'] = int(custom_metrics['n_interest_classes_used'])
-                log_stats['test_custom_fitness'] = float(custom_metrics['custom_fitness'])
-                log_stats['test_mean_f1_interest'] = float(custom_metrics['mean_f1_interest'])
-                log_stats['test_mean_ap50_interest'] = float(custom_metrics['mean_ap50_interest'])
-                log_stats['test_n_interest_classes_used'] = int(custom_metrics['n_interest_classes_used'])
 
             if self.output_dir and dist_utils.is_main_process():
                 with (self.output_dir / "log.txt").open("a") as f:
